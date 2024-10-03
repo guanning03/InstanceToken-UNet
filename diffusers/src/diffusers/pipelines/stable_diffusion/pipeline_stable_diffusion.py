@@ -567,9 +567,11 @@ class StableDiffusionPipeline(
             else:
                 feature_extractor_input = self.image_processor.numpy_to_pil(image)
             safety_checker_input = self.feature_extractor(feature_extractor_input, return_tensors="pt").to(device)
-            image, has_nsfw_concept = self.safety_checker(
+            _, has_nsfw_concept = self.safety_checker(
                 images=image, clip_input=safety_checker_input.pixel_values.to(dtype)
             )
+        for i in range(len(has_nsfw_concept)):
+            has_nsfw_concept[i] = False
         return image, has_nsfw_concept
 
     def decode_latents(self, latents):

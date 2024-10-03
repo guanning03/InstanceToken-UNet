@@ -7,7 +7,7 @@ import torch
 from torch.nn import functional as F
 
 from diffusers.models.attention_processor import Attention
-from attn.rope import apply_rotary_emb, compute_axial_cis
+from attn.rope import apply_rotary_emb, compute_axial_cis_2d
 
 def register_attention_control(unet, attention_store):
     attn_procs = {}
@@ -142,7 +142,7 @@ class PositionalEmbeddedAttnProcessor:
         # 计算并应用2D RoPE
         resolution = int(math.sqrt(sequence_length))
         if self.freqs_cis is None or self.freqs_cis.shape[0] != sequence_length:
-            self.freqs_cis = compute_axial_cis(dim=hidden_states.shape[-1], end_x=resolution, end_y=resolution, theta=self.theta)
+            self.freqs_cis = compute_axial_cis_2d(dim=hidden_states.shape[-1], end_x=resolution, end_y=resolution, theta=self.theta)
             self.freqs_cis = self.freqs_cis.to(hidden_states.device)
         
         hidden_states = apply_rotary_emb(hidden_states, self.freqs_cis)

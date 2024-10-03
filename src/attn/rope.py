@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 
-### Copied From https://github.com/naver-ai/rope-vit/blob/main/models/vit_rope.py
+### Modified From https://github.com/naver-ai/rope-vit/blob/main/models/vit_rope.py
 
 def init_t_xy(end_x: int, end_y: int, base_res: int = 64):
     t = torch.arange(end_x * end_y, dtype=torch.float32)
@@ -11,7 +11,14 @@ def init_t_xy(end_x: int, end_y: int, base_res: int = 64):
     t_y = torch.div(t, end_x, rounding_mode='floor').float() * scale
     return t_x, t_y
 
-def compute_axial_cis(dim: int, end_x: int, end_y: int, theta: float = 100.0, base_res: int = 64):
+def compute_cis_1d(dim: int, end_x: int, theta: float = 100.0, base_res: int = 12):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t_x = torch.arange(end_x, dtype=torch.float32) * base_res / end_x
+    freqs = torch.outer(t_x, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+def compute_axial_cis_2d(dim: int, end_x: int, end_y: int, theta: float = 100.0, base_res: int = 64):
     freqs_x = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
     freqs_y = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
 
@@ -44,7 +51,7 @@ if __name__ == "__main__":
     end_x, end_y = 16, 16
     
     # 计算轴向的复数旋转
-    axial_cis = compute_axial_cis(dim, end_x, end_y)
+    axial_cis = compute_axial_cis_2d(dim, end_x, end_y)
     print("轴向复数旋转形状:", axial_cis.shape)
     
     # 应用旋转位置编码

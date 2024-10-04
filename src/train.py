@@ -418,9 +418,9 @@ def main():
     attention_store = AttentionStore(attn_res = 16)
     register_attention_control(unet, attention_store)
     
-    # Freeze vae and unet
+    # Freeze vae and text encoder
     vae.requires_grad_(False)
-    unet.requires_grad_(False)
+    text_encoder.requires_grad_(False)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -465,9 +465,10 @@ def main():
 
     # Dataset and DataLoaders creation:
     train_dataset = FluxDataset(args.train_data_dir)
+    train_dataset = [train_dataset[0]]  # 只保留第一个item
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+        train_dataset, batch_size=1, shuffle=False, num_workers=0
     )
 
     if args.validation_epochs is not None:

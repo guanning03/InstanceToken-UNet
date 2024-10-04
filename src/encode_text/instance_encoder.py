@@ -17,7 +17,7 @@ class InstanceEncoder:
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids
-        text_embeddings = text_encoder(text_input_ids)
+        text_embeddings = text_encoder(text_input_ids).last_hidden_state[0]
         # encode phrase
         phrase_inputs = tokenizer(
             phrase,

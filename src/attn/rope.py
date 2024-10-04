@@ -42,7 +42,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     x_ = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, x_)
-    x_out = torch.view_as_real(x_ * freqs_cis).flatten(2)
+    x_out = torch.view_as_real(x_ * freqs_cis).flatten(-2)
     return x_out.type_as(x)
 
 if __name__ == "__main__":

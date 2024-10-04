@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 **/*.pyc
 textual_inversion_cat/
+experiments/
+wandb/

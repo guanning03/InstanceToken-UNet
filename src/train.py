@@ -7,6 +7,7 @@ import shutil
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import PIL
@@ -38,10 +39,15 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.utils import check_min_version, is_wandb_available
-from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from diffusers.utils import is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+from load_data.flux import FluxDataset
+from encode_text.instance_encoder import InstanceEncoder
+from attn.attn_loss import AttentionLoss, InitNOAttentionLoss
+from attn.ptp_utils import AttentionStore, register_attention_control
+
+import ast, json
 
 if is_wandb_available():
     import wandb
@@ -126,17 +132,6 @@ def parse_args():
         help="Save learned_embeds.bin every X updates steps.",
     )
     parser.add_argument(
-        "--save_as_full_pipeline",
-        action="store_true",
-        help="Save the complete stable diffusion pipeline.",
-    )
-    parser.add_argument(
-        "--num_vectors",
-        type=int,
-        default=1,
-        help="How many textual inversion vectors shall be used to learn the concept.",
-    )
-    parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
@@ -157,26 +152,8 @@ def parse_args():
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
     parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
         "--train_data_dir", type=str, default=None, required=True, help="A folder containing the training data."
     )
-    parser.add_argument(
-        "--placeholder_token",
-        type=str,
-        default=None,
-        required=True,
-        help="A token to use as a placeholder for the concept.",
-    )
-    parser.add_argument(
-        "--initializer_token", type=str, default=None, required=True, help="A token to use as initializer word."
-    )
-    parser.add_argument("--learnable_property", type=str, default="object", help="Choose between 'object' and 'style'")
-    parser.add_argument("--repeats", type=int, default=100, help="How many times to repeat the training data.")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -192,9 +169,6 @@ def parse_args():
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
         ),
-    )
-    parser.add_argument(
-        "--center_crop", action="store_true", help="Whether to center crop images before resizing to resolution."
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
@@ -245,7 +219,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=1,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -254,13 +228,6 @@ def parse_args():
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -363,6 +330,19 @@ def parse_args():
         action="store_true",
         help="If specified save the checkpoint not in `safetensors` format, but in original PyTorch format instead.",
     )
+    
+    parser.add_argument(
+        "--instance_encoder_config",
+        type=ast.literal_eval,
+        default=None,
+        help="Instance encoder config",
+    )
+    parser.add_argument(
+        "--attn_loss_config",
+        type=ast.literal_eval,
+        default=None,
+        help="Attention loss config",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -374,156 +354,10 @@ def parse_args():
 
     return args
 
-
-imagenet_templates_small = [
-    "a photo of a {}",
-    "a rendering of a {}",
-    "a cropped photo of the {}",
-    "the photo of a {}",
-    "a photo of a clean {}",
-    "a photo of a dirty {}",
-    "a dark photo of the {}",
-    "a photo of my {}",
-    "a photo of the cool {}",
-    "a close-up photo of a {}",
-    "a bright photo of the {}",
-    "a cropped photo of a {}",
-    "a photo of the {}",
-    "a good photo of the {}",
-    "a photo of one {}",
-    "a close-up photo of the {}",
-    "a rendition of the {}",
-    "a photo of the clean {}",
-    "a rendition of a {}",
-    "a photo of a nice {}",
-    "a good photo of a {}",
-    "a photo of the nice {}",
-    "a photo of the small {}",
-    "a photo of the weird {}",
-    "a photo of the large {}",
-    "a photo of a cool {}",
-    "a photo of a small {}",
-]
-
-imagenet_style_templates_small = [
-    "a painting in the style of {}",
-    "a rendering in the style of {}",
-    "a cropped painting in the style of {}",
-    "the painting in the style of {}",
-    "a clean painting in the style of {}",
-    "a dirty painting in the style of {}",
-    "a dark painting in the style of {}",
-    "a picture in the style of {}",
-    "a cool painting in the style of {}",
-    "a close-up painting in the style of {}",
-    "a bright painting in the style of {}",
-    "a cropped painting in the style of {}",
-    "a good painting in the style of {}",
-    "a close-up painting in the style of {}",
-    "a rendition in the style of {}",
-    "a nice painting in the style of {}",
-    "a small painting in the style of {}",
-    "a weird painting in the style of {}",
-    "a large painting in the style of {}",
-]
-
-
-class TextualInversionDataset(Dataset):
-    def __init__(
-        self,
-        data_root,
-        tokenizer,
-        learnable_property="object",  # [object, style]
-        size=512,
-        repeats=100,
-        interpolation="bicubic",
-        flip_p=0.5,
-        set="train",
-        placeholder_token="*",
-        center_crop=False,
-    ):
-        self.data_root = data_root
-        self.tokenizer = tokenizer
-        self.learnable_property = learnable_property
-        self.size = size
-        self.placeholder_token = placeholder_token
-        self.center_crop = center_crop
-        self.flip_p = flip_p
-
-        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
-
-        self.num_images = len(self.image_paths)
-        self._length = self.num_images
-
-        if set == "train":
-            self._length = self.num_images * repeats
-
-        self.interpolation = {
-            "linear": PIL_INTERPOLATION["linear"],
-            "bilinear": PIL_INTERPOLATION["bilinear"],
-            "bicubic": PIL_INTERPOLATION["bicubic"],
-            "lanczos": PIL_INTERPOLATION["lanczos"],
-        }[interpolation]
-
-        self.templates = imagenet_style_templates_small if learnable_property == "style" else imagenet_templates_small
-        self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, i):
-        example = {}
-        image = Image.open(self.image_paths[i % self.num_images])
-
-        if not image.mode == "RGB":
-            image = image.convert("RGB")
-
-        placeholder_string = self.placeholder_token
-        text = random.choice(self.templates).format(placeholder_string)
-
-        example["input_ids"] = self.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids[0]
-
-        # default to score-sde preprocessing
-        img = np.array(image).astype(np.uint8)
-
-        if self.center_crop:
-            crop = min(img.shape[0], img.shape[1])
-            (
-                h,
-                w,
-            ) = (
-                img.shape[0],
-                img.shape[1],
-            )
-            img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
-
-        image = Image.fromarray(img)
-        image = image.resize((self.size, self.size), resample=self.interpolation)
-
-        image = self.flip_transform(image)
-        image = np.array(image).astype(np.uint8)
-        image = (image / 127.5 - 1.0).astype(np.float32)
-
-        example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
-        return example
-
-class CountingDataset(Dataset):
-    pass
-
 def main():
     args = parse_args()
-    if args.report_to == "wandb" and args.hub_token is not None:
-        raise ValueError(
-            "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
-            " Please use `huggingface-cli login` to authenticate with the Hub."
-        )
 
+    args.output_dir = os.path.join('./experiments', args.output_dir)
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     accelerator = Accelerator(
@@ -564,11 +398,7 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load tokenizer
-    if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
-    elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
 
     # Load scheduler and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -581,51 +411,16 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
-
-    # Add the placeholder token in tokenizer
-    placeholder_tokens = [args.placeholder_token]
-
-    if args.num_vectors < 1:
-        raise ValueError(f"--num_vectors has to be larger or equal to 1, but is {args.num_vectors}")
-
-    # add dummy tokens for multi-vector
-    additional_tokens = []
-    for i in range(1, args.num_vectors):
-        additional_tokens.append(f"{args.placeholder_token}_{i}")
-    placeholder_tokens += additional_tokens
-
-    num_added_tokens = tokenizer.add_tokens(placeholder_tokens)
-    if num_added_tokens != args.num_vectors:
-        raise ValueError(
-            f"The tokenizer already contains the token {args.placeholder_token}. Please pass a different"
-            " `placeholder_token` that is not already in the tokenizer."
-        )
-
-    # Convert the initializer_token, placeholder_token to ids
-    token_ids = tokenizer.encode(args.initializer_token, add_special_tokens=False)
-    # Check if initializer_token is a single token or a sequence of tokens
-    if len(token_ids) > 1:
-        raise ValueError("The initializer token must be a single token.")
-
-    initializer_token_id = token_ids[0]
-    placeholder_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
-
-    # Resize the token embeddings as we are adding new special tokens to the tokenizer
-    text_encoder.resize_token_embeddings(len(tokenizer))
-
-    # Initialise the newly added placeholder token with the embeddings of the initializer token
-    token_embeds = text_encoder.get_input_embeddings().weight.data
-    with torch.no_grad():
-        for token_id in placeholder_token_ids:
-            token_embeds[token_id] = token_embeds[initializer_token_id].clone()
-
+    
+    instance_encoder = InstanceEncoder(args.instance_encoder_config)
+    attention_loss = InitNOAttentionLoss(args.attn_loss_config)
+    
+    attention_store = AttentionStore(attn_res = 16)
+    register_attention_control(unet, attention_store)
+    
     # Freeze vae and unet
     vae.requires_grad_(False)
     unet.requires_grad_(False)
-    # Freeze all parameters except for the token embeddings in text encoder
-    text_encoder.text_model.encoder.requires_grad_(False)
-    text_encoder.text_model.final_layer_norm.requires_grad_(False)
-    text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -649,10 +444,19 @@ def main():
         args.learning_rate = (
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
+        
+    def get_attention_params(unet_model):
+        attn_params = []
+        for name, param in unet_model.named_parameters():
+            if 'attn' in name:
+                attn_params.append(param)
+        return attn_params
 
-    # Initialize the optimizer
+    trained_params = get_attention_params(unet)
+
+    # 初始化优化器
     optimizer = torch.optim.AdamW(
-        text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings
+        trained_params,  # 现在这里只包含参数，不包含名称
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -660,20 +464,12 @@ def main():
     )
 
     # Dataset and DataLoaders creation:
-    # TODO: 把这个Dataset改成FluxCountDataset
-    train_dataset = TextualInversionDataset(
-        data_root=args.train_data_dir,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        placeholder_token=(" ".join(tokenizer.convert_ids_to_tokens(placeholder_token_ids))),
-        repeats=args.repeats,
-        learnable_property=args.learnable_property,
-        center_crop=args.center_crop,
-        set="train",
-    )
+    train_dataset = FluxDataset(args.train_data_dir)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )
+
     if args.validation_epochs is not None:
         warnings.warn(
             f"FutureWarning: You are doing logging with validation_epochs={args.validation_epochs}."
@@ -699,11 +495,10 @@ def main():
         num_cycles=args.lr_num_cycles,
     )
 
-    text_encoder.train()
     unet.train()
     # Prepare everything with our `accelerator`.
-    text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        text_encoder, optimizer, train_dataloader, lr_scheduler
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
     )
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -717,8 +512,6 @@ def main():
     # Move vae and unet to device and cast to weight_dtype
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     
     # 每个epoch中实际更新的次数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -729,8 +522,28 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
+    def args_to_json_string(args):
+        """将 args 对象转换为 JSON 格式的字符串"""
+        args_dict = vars(args)
+        
+        # 处理不能直接被 JSON 序列化的类型
+        for k, v in args_dict.items():
+            if isinstance(v, (set, frozenset)):
+                args_dict[k] = list(v)
+            elif not isinstance(v, (int, float, str, bool, list, dict, type(None))):
+                args_dict[k] = str(v)
+        
+        return json.dumps(args_dict, indent=2)
+    
+    def get_formatted_time():
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 在初始化 tracker 时使用这个函数
     if accelerator.is_main_process:
-        accelerator.init_trackers("textual_inversion", config=vars(args))
+        run_name = f"run_{get_formatted_time()}"
+        accelerator.init_trackers("instance_token", 
+                                config={'args': args_to_json_string(args)},
+                                init_kwargs={"wandb": {"name": run_name}})
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -780,15 +593,13 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
-    # keep original embeddings as reference
-    orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
-
     for epoch in range(first_epoch, args.num_train_epochs):
         text_encoder.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(text_encoder):
                 # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample().detach()
+    
+                latents = vae.encode(batch["image"].to(dtype=weight_dtype)).latent_dist.sample().detach()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
@@ -803,7 +614,15 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0].to(dtype=weight_dtype)
+
+                text_embeddings, instance_embeddings = instance_encoder.encode(batch["prompt"][0],
+                                                                             batch['phrase'][0],
+                                                                             batch['count'][0].item(),
+                                                                             tokenizer,
+                                                                             text_encoder)
+                
+                encoder_hidden_states = torch.cat([text_embeddings, instance_embeddings], dim=0).unsqueeze(0)
+                encoder_hidden_states = encoder_hidden_states.to(accelerator.device)
 
                 # Predict the noise residual
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
@@ -816,22 +635,18 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                denoise_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                indices = torch.arange(len(text_embeddings), len(text_embeddings) + len(instance_embeddings)).to(accelerator.device)
+                
+                attn_loss, cross_attn_loss, clean_cross_attn_loss, self_attn_loss = attention_loss(attention_store, indices, batch['masks'][0])
+                
+                total_loss = denoise_loss + attn_loss
 
-                accelerator.backward(loss)
+                accelerator.backward(total_loss)
 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-
-                # Let's make sure we don't update any embedding weights besides the newly added token
-                index_no_updates = torch.ones((len(tokenizer),), dtype=torch.bool)
-                index_no_updates[min(placeholder_token_ids) : max(placeholder_token_ids) + 1] = False
-
-                with torch.no_grad():
-                    accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
-                        index_no_updates
-                    ] = orig_embeds_params[index_no_updates]
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -841,36 +656,23 @@ def main():
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        unet = accelerator.unwrap_model(unet)
+                        os.makedirs(os.path.join(save_path, "unet"), exist_ok=True)
+                        unet.save_pretrained(os.path.join(save_path, "unet"))
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                         images = log_validation(
                             text_encoder, tokenizer, unet, vae, args, accelerator, weight_dtype, epoch
                         )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"total_loss": total_loss.detach().item(), 
+                    "denoise_loss": denoise_loss.detach().item(),
+                    "attn_loss": attn_loss.detach().item(),
+                    "cross_attn_loss (w. scale)": cross_attn_loss.detach().item(),
+                    "clean_cross_attn_loss (w. scale)": clean_cross_attn_loss.detach().item(),
+                    "self_attn_loss (w. scale)": self_attn_loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -878,17 +680,6 @@ def main():
                 break
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        save_full_model = False
-        if save_full_model:
-            pipeline = StableDiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                text_encoder=accelerator.unwrap_model(text_encoder),
-                vae=vae,
-                unet=unet,
-                tokenizer=tokenizer,
-            )
-            pipeline.save_pretrained(args.output_dir)
     
     accelerator.end_training()
 
